@@ -373,7 +373,7 @@ if uploaded:
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Uploaded image", width="stretch")
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Uploaded image", use_column_width=True)
 
     # 1) Detect regions with RapidOCR (no recognition), then recognise with Tesseract
     det_boxes = detect_boxes(img)
