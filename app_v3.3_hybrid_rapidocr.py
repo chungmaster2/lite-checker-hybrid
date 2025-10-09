@@ -99,28 +99,17 @@ def verdict_color_from_ratio(r):
     else:
         return "🟢 Pass AAA"
 
-# ---------------- RapidOCR detect-only ----------------
+# ---------------- RapidOCR detect-only (with safe fallback) ----------------
 @st.cache_resource(show_spinner=False)
 def get_detector():
-    # CPU inference; angle classification on; no CUDA on Streamlit Cloud
-    return RapidOCR(det_use_cuda=False, rec_use_cuda=False, use_angle_cls=True)
+    try:
+        return RapidOCR(det_use_cuda=False, rec_use_cuda=False, use_angle_cls=True)
+    except Exception as e:
+        # If model download or init fails on Cloud, fall back to None (we'll use fallback)
+        st.warning("RapidOCR detector unavailable; using fallback detection.")
+        return None
 
-def detect_boxes(img_bgr):
-    """
-    Use RapidOCR to find text polygons; convert to axis-aligned boxes;
-    merge adjacent boxes that lie on the same line.
-    """
-    ocr = get_detector()
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    boxes, _, _ = ocr(img_rgb)  # boxes = list of polygons [[x,y], ...]
-    rects = []
-    for poly in boxes or []:
-        pts = np.array(poly).astype(int)
-        x, y = np.min(pts[:, 0]), np.min(pts[:, 1])
-        x2, y2 = np.max(pts[:, 0]), np.max(pts[:, 1])
-        rects.append((int(x), int(y), int(x2 - x), int(y2 - y)))
-
-    # Merge horizontally to form lines
+def _merge_line_rects(rects):
     rects = sorted(rects, key=lambda b: (b[1], b[0]))
     merged = []
     for b in rects:
@@ -136,6 +125,53 @@ def detect_boxes(img_bgr):
         else:
             merged.append(b)
     return merged
+
+def fallback_detect_boxes(img_bgr):
+    """Contour-based text-ish detection as a safety net."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 180)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    dil = cv2.dilate(edges, kernel, 1)
+    cnts, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    H, W = gray.shape[:2]
+    rects = []
+    for c in cnts:
+        x, y, w, h = cv2.boundingRect(c)
+        # heuristic filters to avoid huge blobs / tiny specks
+        if w < 20 or h < 12: 
+            continue
+        if w / h < 1.1:
+            continue
+        if w > 0.98 * W and h > 0.30 * H:
+            continue
+        rects.append((x, y, w, h))
+    return _merge_line_rects(rects)
+
+def detect_boxes(img_bgr):
+    """Prefer RapidOCR; if it fails or returns nothing, use fallback."""
+    ocr = get_detector()
+    # Try RapidOCR first
+    try:
+        if ocr is not None:
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            res = ocr(img_rgb)  # RapidOCR returns (boxes, texts, scores) or (None, None, None)
+            if isinstance(res, tuple) and len(res) >= 1 and res[0]:
+                boxes = res[0]
+                rects = []
+                for poly in boxes or []:
+                    pts = np.array(poly).astype(int)
+                    x, y = np.min(pts[:, 0]), np.min(pts[:, 1])
+                    x2, y2 = np.max(pts[:, 0]), np.max(pts[:, 1])
+                    rects.append((int(x), int(y), int(x2 - x), int(y2 - y)))
+                merged = _merge_line_rects(rects)
+                if merged:
+                    return merged
+    except Exception:
+        # swallow and go to fallback
+        pass
+
+    # Fallback path
+    return fallback_detect_boxes(img_bgr)
 
 # ---------------- Recognise (Tesseract) within detected regions ----------------
 def tesseract_words_in_boxes(img_bgr, boxes):
@@ -377,6 +413,12 @@ if uploaded:
 
     # 1) Detect regions with RapidOCR (no recognition), then recognise with Tesseract
     det_boxes = detect_boxes(img)
+
+    if not det_boxes:
+        # Ultimate fallback: run Tesseract over the full image so the app still returns a result
+        H, W = img.shape[:2]
+        det_boxes = [(0, 0, W, H)]
+
     words = tesseract_words_in_boxes(img, det_boxes)
 
     # 2) Group into lines -> style-block segmentation
