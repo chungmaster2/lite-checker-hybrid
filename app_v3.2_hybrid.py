@@ -1,6 +1,6 @@
-# app_v3.2_hybrid.py
-# ===== Lite Checker™ Hybrid (PaddleOCR detect-only + Tesseract recognise) =====
-BUILD_TAG = "LiteChecker-HYBRID v3.2 (2025-10-07)"
+# app_v3.3_hybrid_rapidocr.py
+# ==== Lite Checker™ Hybrid (RapidOCR detect-only + Tesseract recognise) ====
+BUILD_TAG = "LiteChecker-HYBRID (RapidOCR) v3.3 — 2025-10-09"
 print(f">>> USING {BUILD_TAG} <<<")
 
 import streamlit as st
@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import pytesseract
 from pytesseract import Output
-from paddleocr import PaddleOCR
+from rapidocr_onnxruntime import RapidOCR
 from skimage.filters import sobel
 from skimage.measure import shannon_entropy
 
@@ -99,47 +99,40 @@ def verdict_color_from_ratio(r):
     else:
         return "🟢 Pass AAA"
 
-# ---------------- PaddleOCR detect-only ----------------
-# We initialise PaddleOCR with recognition OFF (det only).
+# ---------------- RapidOCR detect-only ----------------
 @st.cache_resource(show_spinner=False)
-def get_paddle_detector():
-    # CPU inference; English detection; recognition disabled
-    return PaddleOCR(use_angle_cls=True, lang='en', rec=False, det=True, use_gpu=False)
+def get_detector():
+    # CPU inference; angle classification on; no CUDA on Streamlit Cloud
+    return RapidOCR(det_use_cuda=False, rec_use_cuda=False, use_angle_cls=True)
 
-def paddle_detect_boxes(img_bgr):
-    """Return list of axis-aligned bboxes [(x,y,w,h), ...] from PaddleOCR polygons."""
-    ocr = get_paddle_detector()
+def detect_boxes(img_bgr):
+    """
+    Use RapidOCR to find text polygons; convert to axis-aligned boxes;
+    merge adjacent boxes that lie on the same line.
+    """
+    ocr = get_detector()
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    result = ocr.ocr(img_rgb, cls=True, det=True, rec=False)
-    boxes = []
-    if not result:
-        return boxes
-    # result is a list per image; each item contains a list of [polygon, ...]
-    for instance in result:
-        for det in instance:
-            poly = det
-            if isinstance(det, tuple) or isinstance(det, list) and len(det) == 2:
-                poly = det[0]  # older paddleocr structures
-            pts = np.array(poly).astype(int)
-            x, y = np.min(pts[:,0]), np.min(pts[:,1])
-            x2, y2 = np.max(pts[:,0]), np.max(pts[:,1])
-            boxes.append((int(x), int(y), int(x2-x), int(y2-y)))
-    # merge small overlaps to form line-like regions
-    boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+    boxes, _, _ = ocr(img_rgb)  # boxes = list of polygons [[x,y], ...]
+    rects = []
+    for poly in boxes or []:
+        pts = np.array(poly).astype(int)
+        x, y = np.min(pts[:, 0]), np.min(pts[:, 1])
+        x2, y2 = np.max(pts[:, 0]), np.max(pts[:, 1])
+        rects.append((int(x), int(y), int(x2 - x), int(y2 - y)))
+
+    # Merge horizontally to form lines
+    rects = sorted(rects, key=lambda b: (b[1], b[0]))
     merged = []
-    for b in boxes:
+    for b in rects:
         if not merged:
             merged.append(b); continue
-        x,y,w,h = b
-        X,Y,W,H = merged[-1]
-        # join if vertically aligned and close
-        same_line = abs((y+h/2) - (Y+H/2)) < max(h,H)*0.6 and (x <= X+W+30)
+        x, y, w, h = b
+        X, Y, W, H = merged[-1]
+        same_line = abs((y + h/2) - (Y + H/2)) < max(h, H) * 0.6 and (x <= X + W + 30)
         if same_line:
-            nx = min(x, X)
-            ny = min(y, Y)
-            nx2 = max(x+w, X+W)
-            ny2 = max(y+h, Y+H)
-            merged[-1] = (nx, ny, nx2-nx, ny2-ny)
+            nx, ny = min(x, X), min(y, Y)
+            nx2, ny2 = max(x + w, X + W), max(y + h, Y + H)
+            merged[-1] = (nx, ny, nx2 - nx, ny2 - ny)
         else:
             merged.append(b)
     return merged
@@ -148,16 +141,15 @@ def paddle_detect_boxes(img_bgr):
 def tesseract_words_in_boxes(img_bgr, boxes):
     """Run Tesseract per region; return word dicts with absolute coords + conf."""
     words = []
-    for li, (x,y,w,h) in enumerate(boxes, start=1):
+    for li, (x, y, w, h) in enumerate(boxes, start=1):
         roi = img_bgr[y:y+h, x:x+w]
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        # multi-pass variants to lift weak text
         variants = [
             gray,
             cv2.bitwise_not(gray),
             cv2.addWeighted(gray, 1.8, cv2.GaussianBlur(gray, (0,0), 1.2), -0.8, 0),
-            cv2.bitwise_not(cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                                  cv2.THRESH_BINARY,31,5))
+            cv2.bitwise_not(cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                  cv2.THRESH_BINARY, 31, 5))
         ]
         for v in variants:
             data = pytesseract.image_to_data(v, output_type=Output.DICT, config="--oem 3 --psm 6")
@@ -181,14 +173,13 @@ def tesseract_words_in_boxes(img_bgr, boxes):
                     "height": wh,
                     "line_num": li
                 })
-    # deduplicate near-identical word boxes
+    # de-dup near-identical word boxes
     deduped = []
     for w in sorted(words, key=lambda x: (x['top'], x['left'])):
         duplicate = False
         for k in deduped:
             if w['text'] == k['text'] and abs(w['left'] - k['left']) < 6 and abs(w['top'] - k['top']) < 6:
-                duplicate = True
-                break
+                duplicate = True; break
         if not duplicate:
             deduped.append(w)
     return deduped
@@ -265,7 +256,6 @@ def segment_blocks_by_style(gray_full, line_blocks, thresh=STYLE_SPLIT_THRESHOLD
     return merged
 
 def verdict_color_from_ratio_block(r):
-    # wrapper that uses current AA/AAA globals
     if r is None or r < 3.0:
         return "🔴 Fail"
     elif r < AA_THRESHOLD:
@@ -352,7 +342,7 @@ def propose_textlike_boxes(gray):
     boxes = []
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
-        if w < 14 or h < 10:  # allow small
+        if w < 14 or h < 10:
             continue
         if w / h < 1.1:
             continue
@@ -374,7 +364,7 @@ def iou(a, b):
 # ---------------- UI ----------------
 st.title(f"🔎 Lite Checker™ — {BUILD_TAG}")
 st.write("Upload an image to get **traffic-light scorecards per block** and a **plain-language summary**. "
-         "This build uses **PaddleOCR (detect only)** + **Tesseract (recognise)** to match your AI version.")
+         "This build uses **RapidOCR (detect only)** + **Tesseract (recognise)** to match your AI version.")
 
 uploaded = st.file_uploader("Upload an image", type=["png","jpg","jpeg"])
 
@@ -385,8 +375,8 @@ if uploaded:
 
     st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Uploaded image", width="stretch")
 
-    # 1) Detect regions with PaddleOCR (no recognition), then recognise with Tesseract
-    det_boxes = paddle_detect_boxes(img)
+    # 1) Detect regions with RapidOCR (no recognition), then recognise with Tesseract
+    det_boxes = detect_boxes(img)
     words = tesseract_words_in_boxes(img, det_boxes)
 
     # 2) Group into lines -> style-block segmentation
